@@ -1,0 +1,32 @@
+[project]
+name = "tilldone"
+version = "1.0.0a0"
+description = "Pluggable agent backend compatibility layer (Claude Code / Codex)"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = []
+
+[project.optional-dependencies]
+# Core has zero runtime dependencies. Install the extra for the backend(s) used.
+claude = ["claude-agent-sdk>=0.1.58"]
+codex = ["mcp>=1.26"]
+
+[dependency-groups]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.24",
+  "pytest-rerunfailures>=16.3",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.15,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+  "integration: live backend tests (opt-in, env-gated; SKIP != PASS)",
+  "archived_app_server: archived v2 app-server tests (manual only)",
+]

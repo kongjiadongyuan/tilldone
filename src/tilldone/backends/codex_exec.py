@@ -31,6 +31,36 @@ from tilldone.core.tools import ToolExecutor
 DEFAULT_CODEX_BIN = os.environ.get("TILLDONE_CODEX_BIN", "codex")
 
 
+async def _iter_lines(stream: Any) -> AsyncIterator[bytes]:
+    """Yield newline-delimited byte lines without StreamReader.readline's size limit."""
+    buf = bytearray()
+    read = getattr(stream, "read", None)
+
+    if read is None:
+        # Existing minimal test doubles predate the chunked stream interface.
+        async for chunk in stream:
+            buf.extend(chunk)
+            while (nl := buf.find(b"\n")) >= 0:
+                line = bytes(buf[:nl])
+                del buf[:nl + 1]
+                yield line
+        if buf:
+            yield bytes(buf)
+        return
+
+    while True:
+        chunk = await read(65536)
+        if not chunk:
+            if buf:
+                yield bytes(buf)
+            return
+        buf.extend(chunk)
+        while (nl := buf.find(b"\n")) >= 0:
+            line = bytes(buf[:nl])
+            del buf[:nl + 1]
+            yield line
+
+
 def _extra_config_key(kv: str) -> str:
     """Return the TOML override key part from a `codex -c key=value` fragment."""
     return kv.split("=", 1)[0].strip()
@@ -148,7 +178,7 @@ class CodexRunHandle:
         if stderr is None:
             return
         try:
-            async for raw in stderr:
+            async for raw in _iter_lines(stderr):
                 line = raw.decode(errors="replace").rstrip()
                 if line:
                     self._stderr_tail.append(line)
@@ -161,7 +191,7 @@ class CodexRunHandle:
         watchdog = asyncio.create_task(self._watchdog()) if self._timeout else None
         stderr_task = asyncio.create_task(self._drain_stderr())
         try:
-            async for raw in self._proc.stdout:
+            async for raw in _iter_lines(self._proc.stdout):
                 line = raw.decode(errors="replace").strip()
                 if not line:
                     continue

@@ -17,6 +17,7 @@ from tilldone.core.spec import AgentRunSpec, ContextDirView, ResumeHandle
 class CorePolicy:
     max_rounds: int = 6
     timeout_s: float | None = None
+    idle_timeout_s: float | None = None
     api_retry_max: int = 2
     # G5 token budget (backend-agnostic). When set, run_task enforces a TOKEN-count
     # upper limit by reading the GENERIC outcome.usage (pure arithmetic, NO backend
@@ -71,6 +72,7 @@ async def run_task(contract: CompletionContract, backend: Backend, *,
                 context_dirs=context_dirs,
                 output_schema=None if caps.host_tool_calls else evaluator.output_schema(),
                 resume=resume, timeout_s=policy.timeout_s,
+                idle_timeout_s=policy.idle_timeout_s,
                 metadata={"attempt": attempt, "retry": retries},
             )
             handle = await backend.start(spec, registry)

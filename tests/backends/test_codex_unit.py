@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -217,3 +218,119 @@ def test_codex_backend_rejects_reserved_mcp_server_name():
 
     with pytest.raises(ValueError, match="tilldone.*reserved"):
         CodexBackend(extra_config=['mcp_servers."tilldone".url="http://127.0.0.1:9/mcp"'])
+
+
+# ---------------- idle / hard timeout (item-level inactivity watchdog) ----------------
+
+class _HangingStream:
+    """吐完 lines 后挂起,直到 killed 被 set(模拟 codex 生成中静默、既不吐也不退)。"""
+
+    def __init__(self, lines, killed):
+        self._lines = [(l + "\n").encode() for l in lines]
+        self._i = 0
+        self._killed = killed
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._i < len(self._lines):
+            line = self._lines[self._i]
+            self._i += 1
+            return line
+        await self._killed.wait()  # 吐完后静默挂起,直到 watchdog kill
+        raise StopAsyncIteration
+
+
+class _HangingProc:
+    def __init__(self, lines, returncode=-9):
+        self._killed = asyncio.Event()
+        self.stdout = _HangingStream(lines, self._killed)
+        self.stderr = _FakeStream([])
+        self.returncode = None
+        self._rc_after_kill = returncode
+
+    async def wait(self):
+        await self._killed.wait()
+        self.returncode = self._rc_after_kill
+        return self.returncode
+
+    def kill(self):
+        self.returncode = self._rc_after_kill
+        self._killed.set()
+
+
+class _PacedStream:
+    """行间带固定间隔地吐,吐完正常结束(模拟 codex 稳定持续出事件)。"""
+
+    def __init__(self, lines, gap):
+        self._lines = [(l + "\n").encode() for l in lines]
+        self._i = 0
+        self._gap = gap
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._i >= len(self._lines):
+            raise StopAsyncIteration
+        if self._i > 0:
+            await asyncio.sleep(self._gap)
+        line = self._lines[self._i]
+        self._i += 1
+        return line
+
+
+class _PacedProc:
+    def __init__(self, lines, gap, returncode=0):
+        self.stdout = _PacedStream(lines, gap)
+        self.stderr = _FakeStream([])
+        self.returncode = returncode
+
+    async def wait(self):
+        return self.returncode
+
+    def kill(self):
+        ...
+
+
+async def test_idle_timeout_fires_on_silence():
+    # 吐了 thread.started + 一条 item 后 codex 静默挂起;idle watchdog 应在 idle_s 后 kill。
+    lines = _lines(
+        {"type": "thread.started", "thread_id": "t1"},
+        {"type": "item.completed", "item": {"type": "agent_message", "id": "a0", "text": "partial"}},
+    )
+    handle = CodexRunHandle(_HangingProc(lines), _FakeBridge(), idle_timeout_s=0.2)
+    events = [ev async for ev in handle.events]
+    outcome = await handle.outcome()
+    assert handle._timeout_kind == "idle"
+    assert events[-1].kind.value == "run_failed"
+    assert outcome.status == "failed"
+    assert outcome.error.code == "timeout"          # timeout 归 transient 语义,可重试
+    assert "idle" in outcome.error.message
+
+
+async def test_idle_timeout_not_fired_while_streaming():
+    # 行间隔(0.05s) < idle_s(0.3s),且 turn.completed 正常收尾 → 不该误杀长输出。
+    lines = _lines(
+        {"type": "thread.started", "thread_id": "t1"},
+        {"type": "item.completed", "item": {"type": "agent_message", "id": "a0", "text": "hi"}},
+        {"type": "turn.completed", "usage": {"input_tokens": 5, "output_tokens": 2}},
+    )
+    handle = CodexRunHandle(_PacedProc(lines, gap=0.05), _FakeBridge(), idle_timeout_s=0.3)
+    events = [ev async for ev in handle.events]
+    outcome = await handle.outcome()
+    assert handle._timeout_kind is None
+    assert outcome.status == "completed"
+    assert events[-1].kind.value == "run_completed"
+
+
+async def test_hard_timeout_still_bounds_when_no_idle():
+    # 只设 hard、不设 idle;stream 挂起 → hard watchdog 到点兜底(向后兼容旧行为)。
+    lines = _lines({"type": "thread.started", "thread_id": "t1"})
+    handle = CodexRunHandle(_HangingProc(lines), _FakeBridge(), timeout_s=0.2)
+    events = [ev async for ev in handle.events]
+    outcome = await handle.outcome()
+    assert handle._timeout_kind == "hard"
+    assert outcome.status == "failed"
+    assert "hard" in outcome.error.message

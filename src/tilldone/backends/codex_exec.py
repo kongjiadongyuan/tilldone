@@ -13,6 +13,7 @@ import contextlib
 import json
 import os
 from collections.abc import AsyncIterator
+from time import monotonic
 from typing import Any
 
 from tilldone.backends.mcp_bridge import SERVER_NAME, BridgeInfo, McpToolBridge
@@ -148,10 +149,14 @@ def build_argv(spec: AgentRunSpec, bridge: BridgeInfo, *,
 class CodexRunHandle:
     """Parses codex `exec --json` (thread/turn/item) stdout into AgentEvents + a RunOutcome."""
 
-    def __init__(self, proc, bridge, *, timeout_s: float | None = None):
+    def __init__(self, proc, bridge, *, timeout_s: float | None = None,
+                 idle_timeout_s: float | None = None):
         self._proc = proc
         self._bridge = bridge
         self._timeout = timeout_s
+        self._idle_timeout = idle_timeout_s
+        self._last_activity = monotonic()
+        self._timeout_kind: str | None = None
         self._stderr_tail: list[str] = []
         self._seq = 0
         self._thread_id: str | None = None
@@ -167,10 +172,24 @@ class CodexRunHandle:
         return AgentEvent(kind, self._seq, data, session_id=self._thread_id, **kw)
 
     async def _watchdog(self) -> None:
-        await asyncio.sleep(self._timeout)
-        self._timed_out = True
-        with contextlib.suppress(ProcessLookupError):
-            self._proc.kill()
+        # idle: 距上次 codex 事件超过 idle_timeout → 判定静默卡死;
+        # hard: 距开始超过 timeout_s → 绝对上限兜底。任一触发即 kill codex。
+        start = monotonic()
+        thresholds = [t for t in (self._idle_timeout, self._timeout) if t]
+        tick = min(min(thresholds), 5.0) if thresholds else 5.0
+        while True:
+            await asyncio.sleep(tick)
+            now = monotonic()
+            if self._idle_timeout and now - self._last_activity > self._idle_timeout:
+                self._timeout_kind = "idle"
+            elif self._timeout and now - start > self._timeout:
+                self._timeout_kind = "hard"
+            else:
+                continue
+            self._timed_out = True
+            with contextlib.suppress(ProcessLookupError):
+                self._proc.kill()
+            return
 
     async def _drain_stderr(self) -> None:
         # stderr MUST be drained or its OS pipe fills and the codex child blocks/leaks.
@@ -188,10 +207,12 @@ class CodexRunHandle:
 
     @property
     async def events(self) -> AsyncIterator[AgentEvent]:
-        watchdog = asyncio.create_task(self._watchdog()) if self._timeout else None
+        watchdog = (asyncio.create_task(self._watchdog())
+                    if (self._timeout or self._idle_timeout) else None)
         stderr_task = asyncio.create_task(self._drain_stderr())
         try:
             async for raw in _iter_lines(self._proc.stdout):
+                self._last_activity = monotonic()  # 收到一行 codex 事件即重置 idle 计时
                 line = raw.decode(errors="replace").strip()
                 if not line:
                     continue
@@ -205,8 +226,11 @@ class CodexRunHandle:
             if self._timed_out:
                 self._failed = True
                 self._terminated = True
-                self._error = BackendError(code="timeout",
-                                           message=f"codex exceeded {self._timeout}s")
+                if self._timeout_kind == "idle":
+                    msg = f"codex idle (no output) for {self._idle_timeout}s"
+                else:
+                    msg = f"codex exceeded hard timeout {self._timeout}s"
+                self._error = BackendError(code="timeout", message=msg)
                 yield self._ev(EventKind.RUN_FAILED, {"error": "timeout"})
             elif not self._terminated:
                 code = self._proc.returncode
@@ -375,7 +399,8 @@ class CodexExecBackend:
         except Exception:
             await bridge.stop()
             raise
-        return CodexRunHandle(proc, bridge, timeout_s=spec.timeout_s)
+        return CodexRunHandle(proc, bridge, timeout_s=spec.timeout_s,
+                              idle_timeout_s=spec.idle_timeout_s)
 
     async def aclose(self) -> None:
         ...

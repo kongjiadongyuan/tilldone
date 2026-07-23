@@ -35,6 +35,7 @@ class AgentRunSpec:
     model: str | None = None
     model_map: Mapping[str, str] | None = None   # tiered model aliases; cross-backend = v2 non-goal
     timeout_s: float | None = None
+    idle_timeout_s: float | None = None
     env: Mapping[str, str] = field(default_factory=dict)
     resume: ResumeHandle | None = None
     native: Mapping[str, Any] = field(default_factory=dict)
